@@ -15,14 +15,14 @@ package executor
 
 import (
 	"context"
-	"sync"
-
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/expression"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"runtime/trace"
+	"sync"
 )
 
 var _ Executor = &HashJoinExec{}
@@ -150,11 +150,96 @@ func (e *HashJoinExec) fetchAndBuildHashTable(ctx context.Context) error {
 
 	// In this stage, you'll read the data from the inner side executor of the join operator and
 	// then use its data to build hash table.
-
 	// You'll need to store the hash table in `e.rowContainer`
 	// and you can call `newHashRowContainer` in `executor/hash_table.go` to build it.
 	// In this stage you can only assign value for `e.rowContainer` without changing any value of the `HashJoinExec`.
+
+	buildSideResultCh := make(chan *chunk.Chunk, 1)
+	doneCh := make(chan struct{})
+	fetchBuildSideRowsOk := make(chan error, 1)
+
+	go util.WithRecovery(
+		func() {
+			defer trace.StartRegion(ctx, "HashJoinBuildSideFetcher").End()
+			e.fetchBuildSideRows(ctx, buildSideResultCh, doneCh)
+		},
+		func(r interface{}) {
+			if r != nil {
+				fetchBuildSideRowsOk <- errors.Errorf("%v", r)
+			}
+			close(fetchBuildSideRowsOk)
+		},
+	)
+
+	// TODO: Parallel build hash table. Currently not support because `unsafeHashTable` is not thread-safe.
+	err := e.buildHashTableForList(buildSideResultCh)
+	if err != nil {
+		//e.buildFinished <- errors.Trace(err)
+		close(doneCh)
+	}
+	// Wait fetchBuildSideRows be finished.
+	// 1. if buildHashTableForList fails
+	// 2. if probeSideResult.NumRows() == 0, fetchProbeSideChunks will not wait for the build side.
+	for range buildSideResultCh {
+	}
+	// Check whether err is nil to avoid sending redundant error into buildFinished.
+	if err == nil {
+		if err = <-fetchBuildSideRowsOk; err != nil {
+			//e.buildFinished <- err
+		}
+	}
 	return nil
+}
+
+func (e *HashJoinExec) buildHashTableForList(buildSideResultCh <-chan *chunk.Chunk) error {
+	buildKeyColIdx := make([]int, len(e.innerKeys))
+	for i := range e.innerKeys {
+		buildKeyColIdx[i] = e.innerKeys[i].Index
+	}
+	hCtx := &hashContext{
+		allTypes:  e.retFieldTypes,
+		keyColIdx: buildKeyColIdx,
+	}
+	var err error
+	var selected []bool
+	chunkList := chunk.NewList(e.retFieldTypes, e.initCap, e.maxChunkSize)
+	e.rowContainer = newHashRowContainer(e.ctx, int(e.innerSideEstCount), hCtx, chunkList)
+	for chk := range buildSideResultCh {
+		selected, err = expression.VectorizedFilter(e.ctx, e.outerSideFilter, chunk.NewIterator4Chunk(chk), selected)
+		if err != nil {
+			return err
+		}
+		err = e.rowContainer.PutChunk(chk)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fetchBuildSideRows fetches all rows from build side executor, and append them
+// to e.buildSideResult.
+func (e *HashJoinExec) fetchBuildSideRows(ctx context.Context, chkCh chan<- *chunk.Chunk, doneCh <-chan struct{}) {
+	defer close(chkCh)
+	var err error
+	for {
+		chk := chunk.NewChunkWithCapacity(e.innerSideExec.base().retFieldTypes, e.ctx.GetSessionVars().MaxChunkSize)
+		err = Next(ctx, e.innerSideExec, chk)
+		if err != nil {
+			//e.buildFinished <- errors.Trace(err)
+			return
+		}
+		if chk.NumRows() == 0 {
+			return
+		}
+		select {
+		case <-doneCh:
+			return
+		case <-e.closeCh:
+			return
+		case chkCh <- chk:
+		}
+	}
 }
 
 func (e *HashJoinExec) initializeForOuter() {
@@ -246,10 +331,45 @@ func (e *HashJoinExec) runJoinWorker(workerID uint, outerKeyColIdx []int) {
 	// In this method, you read the data from the channel e.outerResultChs[workerID].
 	// Then use `e.join2Chunk` method get the joined result `joinResult`,
 	// and put the `joinResult` into the channel `e.joinResultCh`.
+	var (
+		result   *chunk.Chunk
+		selected = make([]bool, 0, chunk.InitialCapacity)
+	)
+
+	hCtx := &hashContext{
+		allTypes:  e.retFieldTypes,
+		keyColIdx: outerKeyColIdx,
+	}
+	ok, joinResult := e.getNewJoinResult(workerID)
+	if !ok {
+		return
+	}
+	for ok := true; ok; {
+		select {
+		case <-e.closeCh:
+			return
+		case result, ok = <-e.outerResultChs[workerID]:
+		}
+		if !ok {
+			break
+		}
+		ok, joinResult = e.join2Chunk(workerID, result, hCtx, joinResult, selected)
+		if !ok {
+			break
+		}
+		result.Reset()
+	}
 
 	// You may pay attention to:
 	//
 	// - e.closeCh, this is a channel tells that the join can be terminated as soon as possible.
+	if joinResult == nil {
+		return
+	} else if joinResult.err != nil || (joinResult.chk != nil && joinResult.chk.NumRows() > 0) {
+		e.joinResultCh <- joinResult
+	} else if joinResult.chk != nil && joinResult.chk.NumRows() == 0 {
+		e.joinChkResourceCh[workerID] <- joinResult.chk
+	}
 }
 
 func (e *HashJoinExec) getNewJoinResult(workerID uint) (bool, *hashjoinWorkerResult) {
