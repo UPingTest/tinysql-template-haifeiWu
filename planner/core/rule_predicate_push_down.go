@@ -357,7 +357,7 @@ func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expressi
 	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
 	if len(la.children) == 0 {
-		return predicates,la
+		return predicates, la
 	}
 
 	child := la.children[0]
