@@ -44,6 +44,7 @@ func (s *joinReorderDPSolver) solve(joinGroup []LogicalPlan, eqConds []expressio
 	// You'll see some common usages in the greedy version.
 
 	// Note that the join tree may be disconnected. i.e. You need to consider the case `select * from t, t1, t2`.
+
 	return nil, errors.Errorf("unimplemented")
 }
 
